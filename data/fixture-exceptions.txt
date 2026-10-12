@@ -1,0 +1,4 @@
+# Plugins that a path rule in tools/kind.mjs would file as test material, confirmed by hand
+# to be installable mods. One id per line, owner/repo:path as in data/mods.json. Only path
+# rules are overridden; a description that says the plugin is not to be installed still wins.
+mako-code/gobworks:mods/abilities/bench

@@ -1,33 +1,82 @@
 name: nightly scan
 
+# The 22:41 run is the full GitHub code search. The three-hourly runs rescan known candidates
+# and seeds, plus repositories pushed since the last scan that repository search finds. Seed
+# additions publish separately (publish-seeds.yml) without waiting for either.
 on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [publish approved seeds]
+    types: [completed]
+    branches: [main]
   schedule:
-    - cron: "30 22 * * *"
+    # Not on the hour: GitHub delays or drops scheduled runs at the start of every hour.
+    - cron: "41 22 * * *"
+    - cron: "17 1-19/3 * * *"
   workflow_dispatch:
     inputs:
       force:
         description: "Open a pull request even when only stars and timestamps moved"
         type: boolean
         default: false
+      crawl:
+        description: "Run the full GitHub code search"
+        type: boolean
+        default: false
   pull_request:
-    paths: ["tools/**", "data/seeds.txt", "package.json", "package-lock.json", ".github/workflows/nightly.yml", ".github/workflows/weekly-retirement.yml"]
+    paths: ["tools/**", "finder/**", "data/seeds.txt", "data/duplicates.txt", "data/catalogs.txt", "data/fixture-exceptions.txt", "package.json", "package-lock.json", ".github/workflows/nightly.yml", ".github/workflows/weekly-retirement.yml", ".github/workflows/publish-seeds.yml"]
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
-# One scan at a time: every run searches GitHub code with the same token, and two runs in the
-# same minute rate-limit each other into hints of ten minutes and more.
-concurrency:
-  group: scan
-  cancel-in-progress: false
+# Skips the validator's nonessential traffic (update checks, telemetry); validator output is the same either way.
+env:
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
 
 jobs:
-  scan:
+  refresh:
+    if: github.event_name == 'push' || github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 30
+    concurrency:
+      group: scan
+      queue: max
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: main
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Check whether the pending scan needs a refresh
+        id: pending
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/publish-scan.sh --check
+      - run: npm ci
+        if: steps.pending.outputs.pending == 'true'
+      - run: npx playwright install --with-deps chromium
+        if: steps.pending.outputs.pending == 'true'
+      - name: Refresh the pending scan against main without rescanning
+        if: steps.pending.outputs.pending == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash tools/publish-scan.sh --refresh
+  scan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: scan-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps: &scan_steps
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.ref || 'main' }}
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
@@ -39,56 +88,121 @@ jobs:
       - run: claude --version
       - run: npm ci
       - run: npm test
-      - run: npx playwright install --with-deps chromium
-      - run: npm run test:render
-      # PRs include submitted seeds without spending the global search rate limit.
-      - run: npm run discover
-        if: github.event_name != 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
-      - run: node tools/candidates.mjs --base "$PR_BASE"
+      # Seed and data-list PRs change no code, so the browser render tests have nothing new to check.
+      - name: Check whether the pull request changes code
+        id: code
         if: github.event_name == 'pull_request'
         env:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
-      - run: npm run scan -- --repos data/pr-repos.txt --required data/pr-required.txt
+        run: |
+          if git diff --name-only "$PR_BASE" HEAD | grep -qE '^(tools/|finder/|package\.json|package-lock\.json|\.github/)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - run: npx playwright install --with-deps chromium
+        if: github.event_name != 'pull_request' || steps.code.outputs.changed == 'true'
+      - run: npm run test:render
+        if: github.event_name != 'pull_request' || steps.code.outputs.changed == 'true'
+      - name: Choose the discovery mode
+        id: mode
+        if: github.event_name != 'pull_request'
+        env:
+          SCHEDULE: ${{ github.event.schedule }}
+          CRAWL: ${{ inputs.crawl }}
+        run: |
+          if [ "$SCHEDULE" = "41 22 * * *" ] || [ "$CRAWL" = "true" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "args=--recent --keep-on-failure" >> "$GITHUB_OUTPUT"
+          else
+            echo "mode=fast" >> "$GITHUB_OUTPUT"
+            echo "args=--recent --skip-code-search" >> "$GITHUB_OUTPUT"
+          fi
+      # Discovery progress waits in the open scan PR until it is merged; the cache hands it to the next run.
+      - name: Restore discovery progress from the last run
+        if: github.event_name != 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/discovery
+          key: discovery-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: discovery-
+      # PRs include submitted seeds without spending the global search rate limit.
+      - name: Discover candidates
+        id: discover
+        if: github.event_name != 'pull_request'
+        run: node tools/discover.mjs ${{ steps.mode.outputs.args }} --restore "$RUNNER_TEMP/discovery/discovery.json" --note "$RUNNER_TEMP/discovery.txt"
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Stage discovery progress for the next run
+        if: steps.discover.outcome == 'success'
+        run: mkdir -p "$RUNNER_TEMP/discovery" && cp data/discovery.json "$RUNNER_TEMP/discovery/discovery.json"
+      - name: Save discovery progress for the next run
+        if: steps.discover.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/discovery
+          key: discovery-${{ github.run_id }}-${{ github.run_attempt }}
+      # A pull request that only adds seeds scans those seeds; publication validates them again
+      # after the merge. Tooling changes still rescan every committed candidate, and so does a
+      # duplicates edit that is not a plain append (candidates.mjs decides). Tests need no rescan:
+      # npm test already ran.
+      - name: Choose the pull request scan scope
+        id: scope
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if git diff --name-only "$PR_BASE" HEAD | grep -vE '^tools/.*\.test\.mjs$' | grep -qE '^(tools/|package\.json|package-lock\.json|\.github/|data/(catalogs|fixture-exceptions)\.txt)'; then
+            echo "args=" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=--seeds-only" >> "$GITHUB_OUTPUT"
+          fi
+      - run: node tools/candidates.mjs --base "$PR_BASE" ${{ steps.scope.outputs.args }}
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+      # Findings for repositories whose default branch has not moved are reused from the last scan with
+      # the same validator and scanner code. PRs read main's cache but never write it.
+      - name: Restore scan findings from the last run
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/scan-cache
+          key: scan-findings-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: scan-findings-
+      - run: npm run scan -- --repos data/pr-repos.txt --required data/pr-required.txt --cache "$RUNNER_TEMP/scan-cache/findings.json"
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-      - run: npm run scan
+      - run: npm run scan -- --cache "$RUNNER_TEMP/scan-cache/findings.json"
+        id: scan
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
-      - run: npm run render
-      - run: npm run lint
-      - name: Decide whether the change is worth a pull request
-        id: worth
-        if: github.event_name != 'pull_request'
-        run: |
-          set +e
-          node tools/changed.mjs > change.txt
-          rc=$?
-          set -e
-          if [ "$rc" = "2" ]; then
-            cat change.txt || true
-            echo "The scan looks partial; failing instead of opening a pull request." >&2
-            exit 1
-          elif [ "$rc" = "0" ]; then
-            echo "open=true" >> "$GITHUB_OUTPUT"
-          elif [ "${{ inputs.force }}" = "true" ] || [ "$(date -u +%u)" = "7" ]; then
-            echo "weekly refresh: stars and timestamps only" > change.txt
-            echo "open=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "open=false" >> "$GITHUB_OUTPUT"
-            git checkout -- .
-          fi
-          cat change.txt || true
-          rm -f change.txt
-      - name: Open or update the scan pull request
-        if: github.event_name != 'pull_request' && steps.worth.outputs.open == 'true'
-        uses: peter-evans/create-pull-request@v7
+      - name: Save scan findings for the next run
+        if: steps.scan.outcome == 'success'
+        uses: actions/cache/save@v4
         with:
-          branch: nightly-scan
-          title: "Nightly scan: refresh footprints and badges"
-          commit-message: "Nightly scan: refresh footprints and badges"
-          body: "Automated discovery and rescan against the current Claude Code release. Known candidates are retained; missing plugins remain unverified until the weekly retirement review. Opened when inventory or validation changes; Sundays also refresh stars. Review README.md and data/mods.json before merging."
-          labels: scan
+          path: ${{ runner.temp }}/scan-cache
+          key: scan-findings-${{ github.run_id }}-${{ github.run_attempt }}
+      - run: npm run render
+        if: github.event_name == 'pull_request'
+      - run: npm run lint
+        if: github.event_name == 'pull_request'
+      - name: Publish the completed scan against current main
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          export SCAN_FORCE="$FORCE"
+          if [ "$MODE" = full ] && [ "$(date -u +%u)" = 7 ]; then export SCAN_FORCE=true; fi
+          bash tools/publish-scan.sh
+  discover:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: scan
+      queue: max
+    steps: *scan_steps

@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { search } from './discover.mjs'
-import { mergeRepos, newSeeds } from './candidates.mjs'
+import { search as discover } from './discover.mjs'
+import { createSearchRequest } from './github-search.mjs'
+import { mergeRepos, newSeeds, prScanRepos, readRepos } from './candidates.mjs'
 import { reconcile, checkRequired } from './inventory.mjs'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from 'node:fs'
@@ -10,6 +11,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const response = items => ({ total_count: items.length, incomplete_results: false, items })
+const search = (q, run, attempts = 4, wait = () => {}, pause = 10) => discover(q, createSearchRequest({ run, attempts, wait, pause, random: () => 0, log: () => {} }))
 const files = n => Array.from({ length: n }, (_, i) => ({ path: `file-${i}`, repository: { full_name: `owner/repo-${i}` }, size: i * 100 }))
 function api(items) {
   return (q, page) => {
@@ -68,7 +70,7 @@ test('pagination cannot silently skip files, repeat files or change total counts
 test('rate limits respect server hints, retry exhaustion fails and auth errors stop immediately', () => {
   const waits = []
   let calls = 0
-  assert.throws(() => search('flag', () => { calls++; throw new Error('HTTP 429 try again in 243s') }, 3, n => waits.push(n), 0), /code search failed/)
+  assert.throws(() => search('flag', () => { calls++; throw Object.assign(new Error('try again in 243s'), { status: 429 }) }, 3, n => waits.push(n), 0), /code search failed/)
   assert.equal(calls, 3)
   assert.deepEqual(waits.filter(Boolean), [244, 244])
   calls = 0
@@ -79,6 +81,9 @@ test('rate limits respect server hints, retry exhaustion fails and auth errors s
 test('candidate history survives a search omission and PR seeds are case-insensitive', () => {
   assert.deepEqual(mergeRepos(['old/mod'], ['New/Mod'], ['new/mod']), ['New/Mod', 'old/mod'])
   assert.deepEqual(newSeeds(['old/mod'], ['OLD/mod', 'new/mod']), ['new/mod'])
+  assert.deepEqual(prScanRepos(['old/mod'], ['old/mod', 'new/mod'], ['new/mod'], true), ['new/mod'])
+  assert.deepEqual(prScanRepos(['old/mod'], ['old/mod', 'new/mod'], ['new/mod'], false), ['new/mod', 'old/mod'])
+  assert.deepEqual(prScanRepos(['old/mod'], ['old/mod'], [], true), [])
 })
 
 const prior = { id: 'old/mod:.', repo: 'old/mod', kind: 'mod', validate: { status: 'passed', claudeVersion: 'old' }, calls: ['$.fs.read'] }
@@ -147,4 +152,43 @@ test('scanner CLI retains unavailable entries and rejects an invalid newly submi
   assert.equal(retired.plugins[0].revision, 'a'.repeat(40))
   assert.equal(retired.repos[0].repo, 'old/mod')
   assert.equal(readFileSync(join(root, 'data/repos.txt'), 'utf8'), '\n')
+})
+
+test('scanner CLI skips a repository with no commits instead of crashing', t => {
+  const root = mkdtempSync(join(tmpdir(), 'discovery-test-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  mkdirSync(join(root, 'data'))
+  mkdirSync(join(root, 'bin'))
+  writeFileSync(join(root, 'data/repos.txt'), 'old/mod\nempty/repo\n')
+  writeFileSync(join(root, 'data/mods.json'), JSON.stringify({ mods: [prior] }))
+  const script = fileURLToPath(new URL('./scan.mjs', import.meta.url))
+  const binary = (name, code) => {
+    const path = join(root, 'bin', name)
+    writeFileSync(path, '#!' + process.execPath + '\n' + code)
+    chmodSync(path, 0o755)
+  }
+  binary('claude', 'console.log("2.1.287")')
+  binary('gh', 'console.log(JSON.stringify({stars:0,defaultBranch:"main"}))')
+  // Both clones succeed; only the empty one has no HEAD to resolve.
+  binary('git', `
+    const fs = require('node:fs');
+    const args = process.argv.slice(2);
+    if (args[0] === 'clone') { fs.mkdirSync(args.at(-1), {recursive:true}); process.exit(0) }
+    if (args.includes('rev-parse') && args.some(a => a.endsWith('empty__repo'))) process.exit(128);
+    console.log('a'.repeat(40));
+  `)
+  const env = { ...process.env, PATH: join(root, 'bin') + ':' + process.env.PATH }
+  const result = spawnSync(process.execPath, [script, '--retire'], { cwd: root, env, encoding: 'utf8' })
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stderr, /clone is empty: empty\/repo/)
+  const retired = JSON.parse(readFileSync(join(root, 'data/retirements.json')))
+  assert.deepEqual(retired.repos.map(entry => entry.repo), ['old/mod'], 'the empty repository is not retired, only the checked one')
+  assert.equal(readFileSync(join(root, 'data/repos.txt'), 'utf8'), 'empty/repo\n')
+})
+
+test('data/seeds.txt stays in alphabetical order so seed PRs do not all edit its last line', () => {
+  const seeds = readRepos('data/seeds.txt')
+  const misplaced = seeds.find((repo, i) => i > 0 && seeds[i - 1].toLowerCase() > repo.toLowerCase())
+  assert.equal(misplaced, undefined, `data/seeds.txt must be in alphabetical order ignoring case; move ${misplaced} to its place instead of appending it`)
+  assert.equal(new Set(seeds.map(repo => repo.toLowerCase())).size, seeds.length, 'data/seeds.txt lists a repository twice')
 })
